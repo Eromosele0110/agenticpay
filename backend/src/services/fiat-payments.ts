@@ -352,6 +352,19 @@ class FiatPaymentsService {
       return undefined;
     }
 
+    // Bank webhook deliveries can be duplicated or arrive out of order.
+    if (payment.status === input.eventType) return payment;
+
+    // Do not allow provider notifications to bypass approval/compliance holds
+    // or regress terminal payment states. A bank return after settlement is valid.
+    const allowedTransitions: Partial<Record<FiatPaymentStatus, Array<typeof input.eventType>>> = {
+      processing: ['settled', 'failed', 'returned'],
+      settled: ['returned'],
+    };
+    if (!allowedTransitions[payment.status]?.includes(input.eventType)) {
+      throw new Error('INVALID_PAYMENT_STATUS_TRANSITION');
+    }
+
     payment.status = input.eventType;
     payment.updatedAt = this.nowIso();
 

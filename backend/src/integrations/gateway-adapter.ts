@@ -124,6 +124,19 @@ export abstract class BaseGatewayAdapter implements IGatewayAdapter {
       const response = await this.executePayment(request);
       const processingTime = Date.now() - startTime;
 
+      // A gateway may resolve successfully at the transport layer while
+      // returning a failed payment. Such responses must count as failures.
+      if (!response.success || response.status === 'failed') {
+        this.recordFailure(processingTime);
+        if (
+          this.health.consecutiveFailures >= this.config.circuitBreakerThreshold ||
+          this.circuitState === CircuitState.HalfOpen
+        ) {
+          this.openCircuit();
+        }
+        return response;
+      }
+
       this.recordSuccess(processingTime);
 
       // Close circuit if half-open
