@@ -3,6 +3,9 @@ import { asyncHandler } from '../middleware/errorHandler.js';
 import { customReportService } from '../services/reports/custom-report.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { exportReportRows, type ReportExportFormat } from '../services/reports/report-export.js';
+import { reconciliationReportService } from '../services/reports/reconciliation-report.js';
+import { financialStatementService } from '../services/reports/financial-statements.js';
+import { payoutFailureAnalyticsService } from '../services/payouts/payout-failure-analytics.js';
 
 export const reportsRouter = Router();
 
@@ -94,3 +97,68 @@ reportsRouter.get('/:id/export', asyncHandler(async (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="${safeName}.${exported.extension}"`);
   res.send(exported.content);
 }));
+
+// ── Reconciliation report (Issue #937) ──────────────────────────────────────
+
+reportsRouter.post(
+  '/reconciliation',
+  asyncHandler(async (req, res) => {
+    const tenantId = resolveTenant(req);
+    const { dateFrom, dateTo, chain, status, format } = req.body ?? {};
+    if (!dateFrom || !dateTo) {
+      throw new AppError(400, 'dateFrom and dateTo are required', 'VALIDATION_ERROR');
+    }
+    const { report, csv, pdf } = await reconciliationReportService.generateReport({
+      dateFrom,
+      dateTo,
+      tenantId,
+      ...(chain ? { chain } : {}),
+      ...(status ? { status } : {}),
+      format: format ?? 'json',
+    });
+    res.json({ report, csv, pdf });
+  }),
+);
+
+// ── Financial statement (Issue #940) ────────────────────────────────────────
+
+reportsRouter.post(
+  '/financial-statement',
+  asyncHandler(async (req, res) => {
+    const tenantId = resolveTenant(req);
+    const { dateFrom, dateTo, chain, status, format } = req.body ?? {};
+    if (!dateFrom || !dateTo) {
+      throw new AppError(400, 'dateFrom and dateTo are required', 'VALIDATION_ERROR');
+    }
+    const { statement, csv, pdf } = await financialStatementService.generateStatement({
+      tenantId,
+      dateFrom,
+      dateTo,
+      ...(chain ? { chain } : {}),
+      ...(status ? { status } : {}),
+      format: format ?? 'json',
+    });
+    res.json({ statement, csv, pdf });
+  }),
+);
+
+// ── Payout failure analytics (Issue #939) ───────────────────────────────────
+
+reportsRouter.get(
+  '/payout-failure-analytics',
+  asyncHandler(async (req, res) => {
+    const tenantId = resolveTenant(req);
+    const { dateFrom, dateTo, merchantId, asset } = req.query as any;
+    if (!dateFrom || !dateTo) {
+      throw new AppError(400, 'dateFrom and dateTo are required', 'VALIDATION_ERROR');
+    }
+    const analytics = await payoutFailureAnalyticsService.generateAnalytics({
+      tenantId,
+      dateFrom,
+      dateTo,
+      ...(merchantId ? { merchantId } : {}),
+      ...(asset ? { asset } : {}),
+    });
+    res.json({ analytics });
+  }),
+);

@@ -83,6 +83,7 @@ import { zapierRouter } from './routes/zapier.js';
 import { intercomRouter } from './routes/intercom.js';
 import { allowancesRouter } from './routes/allowances.js';
 import { payoutsRouter } from './routes/payouts.js';
+import { reportsRouter } from './routes/reports.js';
 import { startPayoutRetryWorker } from './services/payouts/retry-worker.js';
 import { startPayoutBatchWorker } from './services/payouts/payout-batcher.js';
 import { getPrismaReplicaClient } from './db/PrismaReplicaClient.js';
@@ -328,6 +329,7 @@ apiV1Router.use('/splits', splitsRouter);
 apiV1Router.use('/refunds', refundsRouter);
 apiV1Router.use('/allowances', allowancesRouter);
 apiV1Router.use('/payouts', payoutsRouter);
+apiV1Router.use('/reports', reportsRouter);
 apiV1Router.use('/forms', formsRouter);
 // Webhook management and verification
 apiV1Router.use('/webhooks', webhooksRouter);
