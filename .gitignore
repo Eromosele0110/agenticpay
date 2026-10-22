@@ -65,3 +65,8 @@ issue-64.md
 PR_BODY.md
 PR_DESCRIPTION.md
 .todo_webhook_verification.json
+
+# Test snapshots
+*.snap
+test/__snapshots__/
+**/*.snap
