@@ -2,12 +2,16 @@
  * payout-failure-analytics.ts — Issue #939
  *
  * Payout failure analytics dashboard: classifies payout failures, computes
- * failure rates by merchant/asset/provider, and surfaces top failure patterns
- * for a date range.
+ * failure rates per merchant and per settlement asset, and surfaces the top
+ * failure patterns for a date range.
+ *
+ * The payout ledger is the in-process `PayoutEngine` history. Each request
+ * builds its own classifier so counts never leak between calls.
  */
 
-import { FailureAnalytics, classifyFailure, type ErrorCode } from '../failure-analysis.js';
+import { FailureAnalytics, classifyFailure, type ErrorCode, type Severity } from '../failure-analysis.js';
 import { payoutEngine } from './payout-engine.js';
+import { AppError } from '../../middleware/errorHandler.js';
 
 export interface PayoutFailureFilters {
   tenantId: string;
@@ -17,7 +21,7 @@ export interface PayoutFailureFilters {
   asset?: string;
 }
 
-interface FailureRecord {
+export interface FailureRecord {
   id: string;
   payoutId: string;
   merchantId: string;
@@ -29,9 +33,12 @@ interface FailureRecord {
   attempt: number;
   occurredAt: Date;
   txHash?: string;
+  severity: Severity;
+  rootCause: string;
+  resolutions: string[];
 }
 
-interface FailureSummary {
+export interface FailureSummary {
   period: string;
   merchantId: string;
   asset: string;
@@ -43,7 +50,15 @@ interface FailureSummary {
   failedAmount: number;
 }
 
-interface PayoutFailureAnalytics {
+export interface FailurePeriodSummary {
+  period: string;
+  totalPayouts: number;
+  failedPayouts: number;
+  failureRate: number;
+  failedAmount: number;
+}
+
+export interface PayoutFailureAnalytics {
   dateFrom: string;
   dateTo: string;
   tenantId: string;
@@ -51,119 +66,208 @@ interface PayoutFailureAnalytics {
   byErrorCode: Array<{ code: ErrorCode; count: number }>;
   byMerchant: FailureSummary[];
   byAsset: FailureSummary[];
+  byPeriod: FailurePeriodSummary[];
   totals: {
     totalPayouts: number;
     failedPayouts: number;
+    completedPayouts: number;
+    pendingPayouts: number;
     failureRate: number;
     totalAmount: number;
     failedAmount: number;
+    settledAmount: number;
   };
 }
 
-function isFailure(batch: any): boolean {
-  return batch.status === 'failed';
+/** Settlement rail used by the payout engine. */
+const PAYOUT_PROVIDER = 'stellar';
+
+function toNumber(value: unknown): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const parsed = Number(String(value ?? ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function dayKey(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function rate(failed: number, total: number): number {
+  if (total <= 0) return 0;
+  return Number(((failed / total) * 100).toFixed(4));
+}
+
+function emptySummary(overrides: Partial<FailureSummary>): FailureSummary {
+  return {
+    period: '',
+    merchantId: '',
+    asset: '',
+    provider: PAYOUT_PROVIDER,
+    totalPayouts: 0,
+    failedPayouts: 0,
+    failureRate: 0,
+    totalAmount: 0,
+    failedAmount: 0,
+    ...overrides,
+  };
 }
 
 export class PayoutFailureAnalyticsService {
-  private analytics = new FailureAnalytics();
-
+  /**
+   * Builds the analytics payload for a date range.
+   *
+   * Failure rates are computed against every payout in the window, not only
+   * the failed ones, so the rate is a real rate and not always 100%.
+   */
   async generateAnalytics(filters: PayoutFailureFilters): Promise<PayoutFailureAnalytics> {
     const { dateFrom, dateTo, tenantId, merchantId, asset } = filters;
 
+    const from = new Date(`${dateFrom}T00:00:00.000Z`);
+    const to = new Date(`${dateTo}T23:59:59.999Z`);
+
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+      throw new AppError(400, 'dateFrom and dateTo must be valid ISO dates', 'VALIDATION_ERROR');
+    }
+    if (from.getTime() > to.getTime()) {
+      throw new AppError(400, 'dateFrom must not be after dateTo', 'VALIDATION_ERROR');
+    }
+
     const batches = payoutEngine.getPayoutHistory(merchantId);
 
-    const from = new Date(dateFrom);
-    const to = new Date(dateTo + 'T23:59:59.999Z');
-
-    const filtered = batches.filter((b) => {
-      const created = b.createdAt;
+    const filtered = batches.filter((batch) => {
+      const created = batch.createdAt;
       if (created < from || created > to) return false;
-      if (asset && b.asset !== asset) return false;
+      if (merchantId && batch.merchantId !== merchantId) return false;
+      if (asset && batch.asset !== asset) return false;
       return true;
     });
 
+    const analytics = new FailureAnalytics();
     const failures: FailureRecord[] = [];
-    for (const b of filtered) {
-      if (b.status === 'failed') {
-        const classification = classifyFailure({
-          errorMessage: b.errorMessage ?? 'Batch failed',
-          txHash: b.transactionHash,
-        });
-        this.analytics.analyse({
-          errorMessage: b.errorMessage ?? 'Batch failed',
-          txHash: b.transactionHash,
-        });
-        failures.push({
-          id: b.id,
-          payoutId: b.id,
-          merchantId: b.merchantId,
-          asset: b.asset,
-          provider: b.asset,
-          amount: b.amount,
-          errorCode: classification.code,
-          errorMessage: b.errorMessage ?? 'Batch failed',
-          attempt: b.attempts,
-          occurredAt: b.createdAt,
-          txHash: b.transactionHash,
-        });
+
+    const merchantSummaries = new Map<string, FailureSummary>();
+    const assetSummaries = new Map<string, FailureSummary>();
+    const periodSummaries = new Map<string, FailurePeriodSummary>();
+
+    let totalAmount = 0;
+    let failedAmount = 0;
+    let settledAmount = 0;
+    let completedPayouts = 0;
+    let pendingPayouts = 0;
+    let failedPayouts = 0;
+
+    for (const batch of filtered) {
+      const amount = toNumber(batch.amount);
+      const failed = batch.status === 'failed';
+      const period = dayKey(batch.createdAt);
+
+      totalAmount += amount;
+      if (failed) {
+        failedPayouts += 1;
+        failedAmount += amount;
+      } else if (batch.status === 'completed') {
+        completedPayouts += 1;
+        settledAmount += amount;
+      } else {
+        pendingPayouts += 1;
       }
+
+      const merchantSummary =
+        merchantSummaries.get(batch.merchantId) ??
+        emptySummary({ merchantId: batch.merchantId, asset: batch.asset });
+      merchantSummary.totalPayouts += 1;
+      merchantSummary.totalAmount += amount;
+      if (failed) {
+        merchantSummary.failedPayouts += 1;
+        merchantSummary.failedAmount += amount;
+      }
+      merchantSummary.failureRate = rate(merchantSummary.failedPayouts, merchantSummary.totalPayouts);
+      merchantSummaries.set(batch.merchantId, merchantSummary);
+
+      const assetSummary =
+        assetSummaries.get(batch.asset) ?? emptySummary({ asset: batch.asset });
+      assetSummary.totalPayouts += 1;
+      assetSummary.totalAmount += amount;
+      if (failed) {
+        assetSummary.failedPayouts += 1;
+        assetSummary.failedAmount += amount;
+      }
+      assetSummary.failureRate = rate(assetSummary.failedPayouts, assetSummary.totalPayouts);
+      assetSummaries.set(batch.asset, assetSummary);
+
+      const periodSummary =
+        periodSummaries.get(period) ??
+        ({ period, totalPayouts: 0, failedPayouts: 0, failureRate: 0, failedAmount: 0 } as FailurePeriodSummary);
+      periodSummary.totalPayouts += 1;
+      if (failed) {
+        periodSummary.failedPayouts += 1;
+        periodSummary.failedAmount += amount;
+      }
+      periodSummary.failureRate = rate(periodSummary.failedPayouts, periodSummary.totalPayouts);
+      periodSummaries.set(period, periodSummary);
+
+      if (!failed) continue;
+
+      const errorMessage = batch.errorMessage ?? 'Batch failed';
+      const classification = classifyFailure({
+        errorMessage,
+        txHash: batch.transactionHash,
+      });
+      analytics.analyse({ errorMessage, txHash: batch.transactionHash });
+
+      failures.push({
+        id: batch.id,
+        payoutId: batch.id,
+        merchantId: batch.merchantId,
+        asset: batch.asset,
+        provider: PAYOUT_PROVIDER,
+        amount,
+        errorCode: classification.code,
+        errorMessage,
+        attempt: batch.attempts,
+        occurredAt: batch.createdAt,
+        txHash: batch.transactionHash,
+        severity: classification.severity,
+        rootCause: classification.rootCause,
+        resolutions: classification.resolutions,
+      });
     }
 
-    const byErrorCode = this.analytics.getTopFailures(20);
+    const byErrorCode = analytics.getTopFailures(20);
+    const byMerchant = [...merchantSummaries.values()].sort(
+      (a, b) => b.failureRate - a.failureRate || b.failedPayouts - a.failedPayouts,
+    );
+    const byAsset = [...assetSummaries.values()].sort(
+      (a, b) => b.failureRate - a.failureRate || b.failedPayouts - a.failedPayouts,
+    );
+    const byPeriod = [...periodSummaries.values()].sort((a, b) => a.period.localeCompare(b.period));
 
-    const byMerchantMap = new Map<string, FailureSummary>();
-    const byAssetMap = new Map<string, FailureSummary>();
-
-    for (const f of failures) {
-      let m = byMerchantMap.get(f.merchantId);
-      if (!m) {
-        m = { period: '', merchantId: f.merchantId, asset: '', provider: '', totalPayouts: 0, failedPayouts: 0, failureRate: 0, totalAmount: 0, failedAmount: 0 };
-        byMerchantMap.set(f.merchantId, m);
-      }
-      m.totalPayouts += 1;
-      m.failedPayouts += 1;
-      m.totalAmount += f.amount;
-      m.failedAmount += f.amount;
-      m.failureRate = m.totalPayouts > 0 ? (m.failedPayouts / m.totalPayouts) * 100 : 0;
-
-      let a = byAssetMap.get(f.asset);
-      if (!a) {
-        a = { period: '', merchantId: '', asset: f.asset, provider: '', totalPayouts: 0, failedPayouts: 0, failureRate: 0, totalAmount: 0, failedAmount: 0 };
-        byAssetMap.set(f.asset, a);
-      }
-      a.totalPayouts += 1;
-      a.failedPayouts += 1;
-      a.totalAmount += f.amount;
-      a.failedAmount += f.amount;
-      a.failureRate = a.totalPayouts > 0 ? (a.failedPayouts / a.totalPayouts) * 100 : 0;
-    }
-
-    let totalPayouts = filtered.length;
-    let totalAmount = filtered.reduce((s, b) => s + b.amount, 0);
-    let failedAmount = failures.reduce((s, f) => s + f.amount, 0);
-
-    const analytics: PayoutFailureAnalytics = {
+    return {
       dateFrom,
       dateTo,
       tenantId,
       failures,
       byErrorCode,
-      byMerchant: [...byMerchantMap.values()].sort((a, b) => b.failedPayouts - a.failedPayouts),
-      byAsset: [...byAssetMap.values()].sort((a, b) => b.failedPayouts - a.failedPayouts),
+      byMerchant,
+      byAsset,
+      byPeriod,
       totals: {
-        totalPayouts,
-        failedPayouts: failures.length,
-        failureRate: totalPayouts > 0 ? (failures.length / totalPayouts) * 100 : 0,
+        totalPayouts: filtered.length,
+        failedPayouts,
+        completedPayouts,
+        pendingPayouts,
+        failureRate: rate(failedPayouts, filtered.length),
         totalAmount,
         failedAmount,
+        settledAmount,
       },
     };
-
-    return analytics;
   }
 
+  /** Resets the shared classifier state. Kept for API compatibility. */
   clearHistory(): void {
-    this.analytics.clearHistory();
+    // Each request builds its own classifier, so there is no shared state left
+    // to clear. The method remains so existing callers keep working.
   }
 }
 
